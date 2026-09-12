@@ -132,6 +132,46 @@ def _looks_like_localizer(description: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# The competition's own series metadata
+#
+# train_series.csv / test_series.csv carry Fluid_Sensitive, Fat_Suppression and
+# Anatomical_Plane per series. That is ground truth for exactly what
+# classify_sequence() was inferring from free text, and it covers the ~19% of
+# series whose descriptions were stripped to "DummySeriesDesc!". Where it is
+# available we use it; the description parser stays as the fallback.
+# --------------------------------------------------------------------------- #
+
+def load_series_metadata(path: str) -> pd.DataFrame:
+    ts = pd.read_csv(path).rename(columns={
+        "SeriesInstanceUID": "series_uid",
+        "Fluid_Sensitive": "fluid_sensitive",
+        "Fat_Suppression": "fat_suppression",
+        "Anatomical_Plane": "declared_plane",
+    })
+    ts["declared_plane"] = ts["declared_plane"].astype(str).str.strip().str.lower()
+    return ts[["series_uid", "fluid_sensitive", "fat_suppression", "declared_plane"]]
+
+
+def metadata_score(fluid, fat) -> float | None:
+    """Rank a series from the competition's own flags.
+
+    Fluid-sensitive with fat suppression is the combination that shows meniscal
+    tears, effusion, synovitis, bone oedema and contusion — most of our twelve
+    labels. Neither flag set is a T1-like anatomy sequence, which ranks last.
+    """
+    if pd.isna(fluid) or pd.isna(fat):
+        return None
+    fluid, fat = int(fluid), int(fat)
+    if fluid and fat:
+        return 100.0
+    if fluid:
+        return 80.0
+    if fat:
+        return 60.0
+    return 40.0
+
+
+# --------------------------------------------------------------------------- #
 # Laterality
 # --------------------------------------------------------------------------- #
 
@@ -206,7 +246,8 @@ def _drop_unusable_slices(manifest: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 # Step 2 — series-level summary and rules
 # --------------------------------------------------------------------------- #
 
-def build_series_table(manifest: pd.DataFrame) -> pd.DataFrame:
+def build_series_table(manifest: pd.DataFrame,
+                      series_meta: pd.DataFrame | None = None) -> pd.DataFrame:
     """One row per series, with the aggregates the rules and ranking need."""
     m = manifest.sort_values(["series_uid", "depth"]).copy()
 
@@ -236,8 +277,23 @@ def build_series_table(manifest: pd.DataFrame) -> pd.DataFrame:
         "spacing_cv": (gap_std / gap_mean.abs().replace(0, np.nan)).abs(),
     }).reset_index()
 
+    # Description-derived type is kept for the report even when the competition
+    # metadata supersedes it for ranking — it is how you read the report.
     table["sequence"] = table["series_description"].map(classify_sequence)
-    table["sequence_score"] = table["sequence"].map(SEQUENCE_SCORE).fillna(50)
+    from_description = table["sequence"].map(SEQUENCE_SCORE).fillna(50)
+
+    if series_meta is not None:
+        table = table.merge(series_meta, on="series_uid", how="left")
+        from_metadata = table.apply(
+            lambda r: metadata_score(r["fluid_sensitive"], r["fat_suppression"]),
+            axis=1)
+        table["score_source"] = np.where(from_metadata.notna(),
+                                         "series_csv", "description")
+        table["sequence_score"] = from_metadata.fillna(from_description)
+    else:
+        table["score_source"] = "description"
+        table["sequence_score"] = from_description
+
     return table
 
 
@@ -357,6 +413,7 @@ def thin_series(manifest: pd.DataFrame, report: pd.DataFrame,
 # --------------------------------------------------------------------------- #
 
 def filter_manifest(manifest: pd.DataFrame,
+                    series_meta: pd.DataFrame | None = None,
                     min_slices: int = MIN_SLICES,
                     max_per_plane: int = MAX_SERIES_PER_PLANE,
                     target_spacing_mm: float = TARGET_SPACING_MM,
@@ -372,7 +429,7 @@ def filter_manifest(manifest: pd.DataFrame,
     m, laterality_stats = normalise_laterality(manifest)
     m, slice_counts = _drop_unusable_slices(m)
 
-    report = build_series_table(m)
+    report = build_series_table(m, series_meta)
     report["reject_reason"] = report.apply(_reject_reason, axis=1,
                                            min_slices=min_slices)
     report = select_series(report, max_per_plane=max_per_plane)
@@ -418,6 +475,23 @@ def summarise_filter(original: pd.DataFrame, kept: pd.DataFrame,
     print("  selected by sequence type:")
     print(report[report["selected"]]["sequence"].value_counts()
           .to_string().replace("\n", "\n    "))
+
+    if "score_source" in report.columns:
+        print("  ranked using:")
+        print(report[report["selected"]]["score_source"].value_counts()
+              .to_string().replace("\n", "\n    "))
+
+    # Free validation of the step 1 geometry: our plane is computed from the
+    # slice normal, theirs is a label. They should agree almost perfectly.
+    if "declared_plane" in report.columns:
+        both = report.dropna(subset=["declared_plane"])
+        both = both[both["declared_plane"] != "nan"]
+        if len(both):
+            agree = (both["plane"] == both["declared_plane"]).mean()
+            print(f"\ngeometry plane vs Anatomical_Plane: {agree:.3%} agree "
+                  f"({len(both):,} series)")
+            if agree < 0.999:
+                print(pd.crosstab(both["plane"], both["declared_plane"]).to_string())
 
     print("\nslices")
     print(f"  manifest                {len(original):,}")
